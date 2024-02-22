@@ -3,9 +3,53 @@ from transformers import GPT2Tokenizer, GPT2LMHeadModel
 from transformers.modeling_utils import *
 from jericho.util import clean
 from jericho.defines import ILLEGAL_ACTIONS, NO_EFFECT_ACTIONS
-
+from torch.nn import functional as F
 from .base_lm import BaseLM, device
 
+
+class BeamHypotheses(object):
+    def __init__(self, num_beams, max_length, length_penalty, early_stopping):
+        """
+        Initialize n-best list of hypotheses.
+        """
+        self.max_length = max_length - 1  # ignoring bos_token
+        self.length_penalty = length_penalty
+        self.early_stopping = early_stopping
+        self.num_beams = num_beams
+        self.beams = []
+        self.worst_score = 1e9
+
+    def __len__(self):
+        """
+        Number of hypotheses in the list.
+        """
+        return len(self.beams)
+
+    def add(self, hyp, sum_logprobs):
+        """
+        Add a new hypothesis to the list.
+        """
+        score = sum_logprobs / len(hyp) ** self.length_penalty
+        if len(self) < self.num_beams or score > self.worst_score:
+            self.beams.append((score, hyp))
+            if len(self) > self.num_beams:
+                sorted_scores = sorted([(s, idx) for idx, (s, _) in enumerate(self.beams)])
+                del self.beams[sorted_scores[0][1]]
+                self.worst_score = sorted_scores[1][0]
+            else:
+                self.worst_score = min(score, self.worst_score)
+
+    def is_done(self, best_sum_logprobs):
+        """
+        If there are enough hypotheses and that none of the hypotheses being generated
+        can become better than the worst one in the heap, then we are done with this sentence.
+        """
+        if len(self) < self.num_beams:
+            return False
+        elif self.early_stopping:
+            return True
+        else:
+            return self.worst_score >= best_sum_logprobs / self.max_length ** self.length_penalty
 
 class GPT2LM(BaseLM):
     def load_model(self, model_path):
@@ -23,7 +67,7 @@ class GPT2LM(BaseLM):
         if not ret: ret = [0]
         return ret
 
-    def sent2ids(self, sent, maxlen=512):
+    def sent2ids(self, sent, maxlen=512) -> List[int]:
         ret = self.tokenizer.encode(clean(sent))
         if len(ret) > maxlen:
             ret = ret[-maxlen:]
@@ -64,9 +108,56 @@ class GPT2LM(BaseLM):
         return scores
 
 
+def top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float("Inf"), min_tokens_to_keep=1):
+    """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering.
+        Args:
+            logits: logits distribution shape (batch size * num_beams, vocabulary size)
+            if top_k > 0: keep only top k tokens with highest probability (top-k filtering).
+            if top_p < 1.0: keep the top tokens with cumulative probability >= top_p (nucleus filtering).
+                Nucleus filtering is described in Holtzman et al. (http://arxiv.org/abs/1904.09751)
+            Make sure we keep at least min_tokens_to_keep per batch example in the output
+        From: https://gist.github.com/thomwolf/1a5a29f6962089e871b94cbd09daf317
+    """
+    # *: The logits are filtered by setting the non-top tokens to filter_value (-infinity)
+    # ?: Why do they even allow both top_k and min_tokens_to_keep to both be set
+    # ?: Nvm this is a bad question, logits are unscaled before softmax. Does this scale up the remaining logits to sum to 1?
+    if top_k > 0:
+        top_k = min(max(top_k, min_tokens_to_keep), logits.size(-1))  # Safety check
+        # Sets all tokens with a probability less than the last token of the top-k to -inf
+        # * shape of torch.top(k)[0] should be (batch_size * num_beams, k)
+        # * shape of torch.topk(logits, top_k)[0][..., -1, None] should be (batch_size * num_beams, 1, 1)
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits[indices_to_remove] = filter_value
+
+
+
+    if top_p < 1.0:
+        # the logits for each batch, beam pair are sorted in descending order
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        # cumulative probability[i] is the sum of the probabilities of the sorted tokens up to the i-th token
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+        # Remove tokens with cumulative probability above the threshold (token with 0 are kept)
+        # ? what does token with 0 are kept mean here
+            # means that if sorted_indices_to_remove[i, j] == 0, then sorted_indices[i, j] is kept
+        sorted_indices_to_remove = cumulative_probs > top_p
+        if min_tokens_to_keep > 1:
+            # Keep at least min_tokens_to_keep (set to min_tokens_to_keep-1 because we add the first one below)
+            sorted_indices_to_remove[..., :min_tokens_to_keep] = 0
+        # Shift the indices to the right to keep also the first token above the threshold
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+
+        # scatter sorted tensors to original indexing
+        # * I'm assuming that scatter just maps these indices back to the original logits tensor
+        # ?: Why did they switch from dim -1 to dim 1 
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits[indices_to_remove] = filter_value
+    return logits
+
 @torch.no_grad()
 def generate_topk(
-        self,
+        self: GPT2LMHeadModel,
         input_ids=None,
         max_length=None,
         do_sample=True,
@@ -163,47 +254,32 @@ def generate_topk(
     else:
         effective_batch_size = batch_size
 
-    if num_beams > 1:
-        output = _generate_beam_search_topk(
-            self,
-            input_ids,
-            cur_len,
-            max_length,
-            do_sample,
-            temperature,
-            top_k,
-            top_p,
-            repetition_penalty,
-            pad_token_id,
-            eos_token_ids,
-            effective_batch_size,
-            length_penalty,
-            num_beams,
-            vocab_size,
-            num_return_sequences,
-            mask_out
-        )
-    else:
-        output = _generate_no_beam_search(
-            self,
-            input_ids,
-            cur_len,
-            max_length,
-            do_sample,
-            temperature,
-            top_k,
-            top_p,
-            repetition_penalty,
-            pad_token_id,
-            eos_token_ids,
-            effective_batch_size,
-        )
+    output = _generate_beam_search_topk(
+        self,
+        input_ids,
+        cur_len,
+        max_length,
+        do_sample,
+        temperature,
+        top_k,
+        top_p,
+        repetition_penalty,
+        pad_token_id,
+        eos_token_ids,
+        effective_batch_size,
+        length_penalty,
+        num_beams,
+        vocab_size,
+        num_return_sequences,
+        mask_out
+    )
+
 
     return output
 
 
 def _generate_beam_search_topk(
-        self,
+        self: GPT2LMHeadModel,
         input_ids,
         cur_len,
         max_length,
@@ -232,12 +308,14 @@ def _generate_beam_search_topk(
 
     # generated hypotheses
     generated_hyps = [
-        BeamHypotheses(num_beams, max_length, length_penalty=0, early_stopping=False) for _ in range(batch_size)
+        BeamHypotheses(num_beams=num_beams, max_length=max_length, length_penalty=0, early_stopping=False) for _ in range(batch_size)
     ]
 
     # scores for each sentence in the beam
     beam_scores = torch.zeros((batch_size, num_beams), dtype=torch.float, device=input_ids.device)
+    # TODO: why do we set the scores to negative infinity from 1: instead of 0:?
     beam_scores[:, 1:] = -1e9
+    # TODO: what's the point of flattening this here?
     beam_scores = beam_scores.view(-1)  # shape (batch_size * num_beams,)
 
     # cache compute states
@@ -247,23 +325,11 @@ def _generate_beam_search_topk(
     done = [False for _ in range(batch_size)]
 
     while cur_len < max_length:
+        # TODO: Review this later. Document shape and data type.
         model_inputs = self.prepare_inputs_for_generation(input_ids, past=past)
         outputs = self(**model_inputs)  # (batch_size * num_beams, cur_len, vocab_size)
+        # for each sentences, for each beam, get the output probability distribution over the vocabulary
         scores = outputs[0][:, -1, :]  # (batch_size * num_beams, vocab_size)
-
-        # if model has past, then set the past variable to speed up decoding
-        if self._do_output_past(outputs):
-            past = outputs[1]
-
-        # repetition penalty (from CTRL paper https://arxiv.org/abs/1909.05858)
-        if repetition_penalty != 1.0 and False:
-            for i in range(batch_size * num_beams):
-                for previous_token in set(input_ids[i].tolist()):
-                    # if score < 0 then repetition penalty has to multiplied to reduce the previous token probability
-                    if scores[i, previous_token] < 0:
-                        scores[i, previous_token] *= repetition_penalty
-                    else:
-                        scores[i, previous_token] /= repetition_penalty
 
         if do_sample:
             # Temperature (higher temperature => more likely to sample low probability tokens)
@@ -323,7 +389,7 @@ def _generate_beam_search_topk(
             for idx, score in zip(next_words[batch_idx], next_scores[batch_idx]):
 
                 # get beam and word IDs
-                beam_id = idx // vocab_size
+                beam_id = torch.div(idx, vocab_size, rounding_mode='trunc')
                 word_id = idx % vocab_size
 
                 # add to generated hypotheses if end of sentence or last iteration

@@ -1,0 +1,4 @@
+venv/*
+calm/cleaned_corpora/*
+model_weights/*
+*/__pycache__/*
